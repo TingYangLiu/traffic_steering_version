@@ -5,9 +5,9 @@
         {
             "name": "trafficxapp",
             "image": {
-                "registry": "nexus3.o-ran-sc.org:10002",
+                "registry": "127.0.0.1:5000",
                 "name": "o-ran-sc/ric-app-ts",
-                "tag": "1.2.5"
+                "tag": "latest"
             }
         }
     ],
@@ -22,8 +22,13 @@
                     "A1_POLICY_REQ",
                     "TS_ANOMALY_UPDATE"
                 ],
-                "txMessages": [ "TS_UE_LIST", "TS_ANOMALY_ACK" ],
-                "policies": [20008],
+                "txMessages": [
+                    "TS_UE_LIST",
+                    "TS_ANOMALY_ACK"
+                ],
+                "policies": [
+                    20008
+                ],
                 "description": "rmr receive data port for trafficxapp"
             },
             {
@@ -47,11 +52,12 @@
             "A1_POLICY_REQ",
             "TS_ANOMALY_UPDATE"
         ],
-        "policies": [20008]
+        "policies": [
+            20008
+        ]
     },
     "controls": {
-        "ts_control_api": "rest",
-        "ts_control_ep": "http://127.0.0.1:5000/api/echo"
+        "ts_control_api": "grpc",
+        "ts_control_ep": "http://10.100.55.54:7777"
     }
-
 }

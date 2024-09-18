@@ -671,112 +671,191 @@ void send_grpc_control_request( string ue_id, string target_cell_id ) {
 }
 
 void prediction_callback( Message& mbuf, int mtype, int subid, int len, Msg_component payload,  void* data ) {
-  string json ((char *)payload.get(), len); // RMR payload might not have a nil terminanted char
-
-  cout << "[INFO] Prediction Callback got a message, type=" << mtype << ", length=" << len << "\n";
-  cout << "[INFO] Payload is " << json << endl;
-
-  PredictionHandler handler;
   try {
+    // Cek apakah panjang buffer sesuai dengan panjang yang ditetapkan
+    if (len < 0) {
+        throw runtime_error("Invalid length for payload");
+    }
+
+    // Pastikan string memiliki terminator null jika buffer mungkin tidak null-terminated
+    string json;
+    if (len > 0) {
+        // Buat string dengan buffer dan pastikan terminator null di akhir
+        json.assign((char *)payload.get(), len);
+        if (json.back() != '\0') {
+            json.push_back('\0');
+        }
+    }
+
+    cout << "[INFO] Prediction Callback got a message, type=" << mtype << ", length=" << len << "\n";
+    cout << "[INFO] Prediction Callback got a message -1\n";
+
+    sleep(10);
+
+    cout << "[INFO] Payload is " << json << std::endl;
+
+    cout << "[INFO] Parsing the prediction message begin\n";
+    PredictionHandler handler;  // Deklarasi handler untuk memproses pesan
+    cout << "[INFO] Parsing the prediction message begin 1\n";
     Reader reader;
     StringStream ss(json.c_str());
+    cout << "[INFO] Parsing the prediction message\n";
     reader.Parse(ss,handler);
+    cout << "[INFO] Parsing the prediction message done\n";
+
+    // We are only considering download throughput
+    unordered_map<string, int> throughput_map = handler.cell_pred_down;
+
+    // Decision about CONTROL message
+    // (1) Identify UE Id in Prediction message
+    // (2) Iterate through Prediction message.
+    //     If one of the cells has a higher throughput prediction than serving cell, send a CONTROL request
+    //     We assume the first cell in the prediction message is the serving cell
+
+    int serving_cell_throughput = 0;
+    int highest_throughput = 0;
+    string highest_throughput_cell_id;
+
+    // Getting the current serving cell throughput prediction
+    auto cell = throughput_map.find( handler.serving_cell_id );
+    serving_cell_throughput = cell->second;
+
+    // Iterating to identify the highest throughput prediction
+    for (auto map_iter = throughput_map.begin(); map_iter != throughput_map.end(); map_iter++) {
+
+      string curr_cellid = map_iter->first;
+      int curr_throughput = map_iter->second;
+
+      if ( highest_throughput < curr_throughput ) {
+        highest_throughput = curr_throughput;
+        highest_throughput_cell_id = curr_cellid;
+      }
+
+    }
+
+    float thresh = 0;
+    if( downlink_threshold > 0 ) {  // we also take into account the threshold in A1 policy type 20008
+      thresh = serving_cell_throughput * (downlink_threshold / 100.0);
+    }
+
+    if ( highest_throughput > ( serving_cell_throughput + thresh ) ) {
+
+      // sending a control request message
+      if ( ts_control_api == TsControlApi::REST ) {
+        send_rest_control_request( handler.ue_id, handler.serving_cell_id, highest_throughput_cell_id );
+      } else {
+        send_grpc_control_request( handler.ue_id, highest_throughput_cell_id );
+      }
+
+    } else {
+      cout << "[INFO] The current serving cell \"" << handler.serving_cell_id << "\" is the best one" << endl;
+    }
   } catch (...) {
     cout << "[ERROR] Got an exception on stringstream read parse\n";
   }
 
-  // We are only considering download throughput
-  unordered_map<string, int> throughput_map = handler.cell_pred_down;
-
-  // Decision about CONTROL message
-  // (1) Identify UE Id in Prediction message
-  // (2) Iterate through Prediction message.
-  //     If one of the cells has a higher throughput prediction than serving cell, send a CONTROL request
-  //     We assume the first cell in the prediction message is the serving cell
-
-  int serving_cell_throughput = 0;
-  int highest_throughput = 0;
-  string highest_throughput_cell_id;
-
-  // Getting the current serving cell throughput prediction
-  auto cell = throughput_map.find( handler.serving_cell_id );
-  serving_cell_throughput = cell->second;
-
-   // Iterating to identify the highest throughput prediction
-  for (auto map_iter = throughput_map.begin(); map_iter != throughput_map.end(); map_iter++) {
-
-    string curr_cellid = map_iter->first;
-    int curr_throughput = map_iter->second;
-
-    if ( highest_throughput < curr_throughput ) {
-      highest_throughput = curr_throughput;
-      highest_throughput_cell_id = curr_cellid;
-    }
-
-  }
-
-  float thresh = 0;
-  if( downlink_threshold > 0 ) {  // we also take into account the threshold in A1 policy type 20008
-    thresh = serving_cell_throughput * (downlink_threshold / 100.0);
-  }
-
-  if ( highest_throughput > ( serving_cell_throughput + thresh ) ) {
-
-    // sending a control request message
-    if ( ts_control_api == TsControlApi::REST ) {
-      send_rest_control_request( handler.ue_id, handler.serving_cell_id, highest_throughput_cell_id );
-    } else {
-      send_grpc_control_request( handler.ue_id, highest_throughput_cell_id );
-    }
-
-  } else {
-    cout << "[INFO] The current serving cell \"" << handler.serving_cell_id << "\" is the best one" << endl;
-  }
-
 }
 
-void send_prediction_request( vector<string> ues_to_predict ) {
-  std::unique_ptr<Message> msg;
-  Msg_component payload;           // special type of unique pointer to the payload
+void send_prediction_request(vector<string> ues_to_predict) {
+    size_t max_payload_size = 2000; // Batas ukuran payload yang aman
+    size_t batch_size = 100; // Ukuran batch untuk memecah payload menjadi bagian yang lebih kecil
+    int max_iterations = 1;
 
-  int sz;
-  int i;
-  size_t plen;
-  Msg_component send_payload;
+    for (int iteration = 0; iteration < max_iterations && iteration * batch_size < ues_to_predict.size(); ++iteration) {
+        size_t start = iteration * batch_size;
 
-  msg = xfw->Alloc_msg( 2048 );
+        std::unique_ptr<Message> msg;
+        Msg_component payload;  // special type of unique pointer to the payload
+        int sz;
+        size_t plen;
+        Msg_component send_payload;
 
-  sz = msg->Get_available_size();  // we'll reuse a message if we received one back; ensure it's big enough
-  if( sz < 2048 ) {
-    fprintf( stderr, "[ERROR] message returned did not have enough size: %d [%d]\n", sz, i );
-    exit( 1 );
-  }
+        msg = xfw->Alloc_msg(2048);
 
-  string ues_list = "[";
+        sz = msg->Get_available_size();  // we'll reuse a message if we received one back; ensure it's big enough
+        if (sz < 2048) {
+            fprintf(stderr, "[ERROR] message returned did not have enough size: %d\n", sz);
+            exit(1);
+        }
 
-  for (int i = 0; i < ues_to_predict.size(); i++) {
-    if (i == ues_to_predict.size() - 1) {
-      ues_list = ues_list + "\"" + ues_to_predict.at(i) + "\"]";
-    } else {
-      ues_list = ues_list + "\"" + ues_to_predict.at(i) + "\"" + ",";
+        string ues_list = "[";
+        for (size_t i = start; i < start + batch_size && i < ues_to_predict.size(); ++i) {
+            ues_list += "\"" + ues_to_predict[i] + "\"";
+            if (i < start + batch_size - 1 && i < ues_to_predict.size() - 1) {
+                ues_list += ",";
+            }
+        }
+        ues_list += "]";
+
+        string message_body = "{\"UEPredictionSet\": " + ues_list + "}";
+
+        if (message_body.length() > max_payload_size) {
+            fprintf(stderr, "[ERROR] JSON payload is too large: %zu bytes\n", message_body.length());
+            return;
+        }
+
+        send_payload = msg->Get_payload(); // direct access to payload
+        snprintf((char *)send_payload.get(), 2048, "%s", message_body.c_str());
+
+        plen = strlen((char *)send_payload.get());
+
+        // Validasi apakah JSON benar-benar valid
+        if (send_payload.get()[0] != '{' || send_payload.get()[plen-1] != '}') {
+            fprintf(stderr, "[ERROR] Invalid JSON format\n");
+            return;
+        }
+
+        cout << "[INFO] Prediction Request length=" << plen << ", payload=" << send_payload.get() << endl;
+
+        // payload updated in place, nothing to copy from, so payload parm is nil
+        if (!msg->Send_msg(TS_UE_LIST, Message::NO_SUBID, plen, NULL)) { // msg type 30000
+            fprintf(stderr, "[ERROR] send failed: %d\n", msg->Get_state());
+        }
     }
-  }
-
-  string message_body = "{\"UEPredictionSet\": " + ues_list + "}";
-
-  send_payload = msg->Get_payload(); // direct access to payload
-  snprintf( (char *) send_payload.get(), 2048, "%s", message_body.c_str() );
-
-  plen = strlen( (char *)send_payload.get() );
-
-  cout << "[INFO] Prediction Request length=" << plen << ", payload=" << send_payload.get() << endl;
-
-  // payload updated in place, nothing to copy from, so payload parm is nil
-  if ( ! msg->Send_msg( TS_UE_LIST, Message::NO_SUBID, plen, NULL )) { // msg type 30000
-    fprintf( stderr, "[ERROR] send failed: %d\n", msg->Get_state() );
-  }
-
 }
+
+// void send_prediction_request( vector<string> ues_to_predict ) {
+//   std::unique_ptr<Message> msg;
+//   Msg_component payload;           // special type of unique pointer to the payload
+
+//   int sz;
+//   int i;
+//   size_t plen;
+//   Msg_component send_payload;
+
+//   msg = xfw->Alloc_msg( 2048 );
+
+//   sz = msg->Get_available_size();  // we'll reuse a message if we received one back; ensure it's big enough
+//   if( sz < 2048 ) {
+//     fprintf( stderr, "[ERROR] message returned did not have enough size: %d [%d]\n", sz, i );
+//     exit( 1 );
+//   }
+
+//   string ues_list = "[";
+
+//   for (int i = 0; i < ues_to_predict.size(); i++) {
+//     if (i == ues_to_predict.size() - 1) {
+//       ues_list = ues_list + "\"" + ues_to_predict.at(i) + "\"]";
+//     } else {
+//       ues_list = ues_list + "\"" + ues_to_predict.at(i) + "\"" + ",";
+//     }
+//   }
+
+//   string message_body = "{\"UEPredictionSet\": " + ues_list + "}";
+
+//   send_payload = msg->Get_payload(); // direct access to payload
+//   snprintf( (char *) send_payload.get(), 2048, "%s", message_body.c_str() );
+
+//   plen = strlen( (char *)send_payload.get() );
+
+//   cout << "[INFO] Prediction Request length=" << plen << ", payload=" << send_payload.get() << endl;
+
+//   // payload updated in place, nothing to copy from, so payload parm is nil
+//   if ( ! msg->Send_msg( TS_UE_LIST, Message::NO_SUBID, plen, NULL )) { // msg type 30000
+//     fprintf( stderr, "[ERROR] send failed: %d\n", msg->Get_state() );
+//   }
+
+// }
 
 /* This function works with Anomaly Detection(AD) xApp. It is invoked when anomalous UEs are send by AD xApp.
  * It parses the payload received from AD xApp, sends an ACK with same UEID as payload to AD xApp, and
@@ -871,7 +950,7 @@ bool build_cell_mapping() {
 }
 
 extern int main( int argc, char** argv ) {
-  int nthreads = 1;
+  int nthreads = 4;
   char*	port = (char *) "4560";
   shared_ptr<grpc::Channel> channel;
 
@@ -899,7 +978,9 @@ extern int main( int argc, char** argv ) {
   xfw = std::unique_ptr<Xapp>( new Xapp( port, true ) );
 
   xfw->Add_msg_cb( A1_POLICY_REQ, policy_callback, NULL );          // msg type 20010
+  
   xfw->Add_msg_cb( TS_QOE_PREDICTION, prediction_callback, NULL );  // msg type 30002
+
   xfw->Add_msg_cb( TS_ANOMALY_UPDATE, ad_callback, NULL ); /*Register a callback function for msg type 30003*/
 
   xfw->Run( nthreads );
